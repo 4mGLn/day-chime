@@ -1,0 +1,12 @@
+/target/
+/config.toml
+/.env
+*.log
+
+*.env
+__pycache__/
+/native-host/
+
+/dist/
+/.omc/
+/.release/

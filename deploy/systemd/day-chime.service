@@ -1,0 +1,15 @@
+[Unit]
+Description=Day Chime attendance reminder
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/day-chime --config %h/.config/day-chime/config.toml run
+EnvironmentFile=-%h/.config/day-chime/credentials.env
+Restart=on-failure
+RestartSec=30
+UMask=0077
+
+[Install]
+WantedBy=graphical-session.target

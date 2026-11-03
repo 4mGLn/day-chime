@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>Day Chime</title>
+  <link rel="icon" type="image/png" href="icons/icon-128.png">
+  <style>
+    body{font:14px system-ui,sans-serif;width:300px;margin:0;padding:20px;line-height:1.65;color:#29233c;background:#fffaf3}
+    header{display:flex;align-items:center;gap:12px;margin-bottom:18px}
+    header img{width:48px;height:48px;flex:none}
+    h1{font-size:20px;line-height:1.2;margin:0;letter-spacing:-.4px}
+    .tagline{font-size:12px;color:#786b79;margin:4px 0 0}
+    .status-card{padding:14px;border:1px solid #f2ddc2;border-radius:14px;background:#fff}
+    #status{margin:0 0 6px;overflow-wrap:anywhere}
+    small{font-size:11px;color:#786b79}
+    .help{font-size:12px;color:#695e6c;margin:16px 0 0}
+  </style>
+</head>
+<body>
+  <header>
+    <img src="icons/icon-128.png" width="48" height="48" alt="">
+    <div><h1>Day Chime</h1><p class="tagline">하루의 시작과 마무리를 가볍게</p></div>
+  </header>
+  <section class="status-card" aria-label="연결 상태">
+    <p id="status" role="status">연결 상태를 확인하고 있습니다.</p>
+    <small id="time"></small>
+  </section>
+  <p class="help">Brave 시작 시 오늘 출근 기록을 자동 확인합니다. 출근 확인 알림을 받으면 Brave를 닫아도 됩니다. 로그인 만료 시에는 직접 로그인해 주세요.</p>
+  <script src="popup.js"></script>
+</body>
+</html>

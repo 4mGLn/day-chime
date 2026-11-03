@@ -1,0 +1,72 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to release (for example v0.4.0)
+        required: true
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Verify version and checks
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, tomllib
+          version = tomllib.load(open('Cargo.toml', 'rb'))['package']['version']
+          assert os.environ['RELEASE_TAG'] == 'v' + version, 'Tag must match Cargo.toml'
+          PY
+          cargo fmt --check
+          cargo test --locked --target x86_64-unknown-linux-musl
+          cargo clippy --all-targets --locked --target x86_64-unknown-linux-musl -- -D warnings
+          node --test extension/tests/*.test.cjs
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+      - name: Build and package
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+          sh scripts/package-release.sh --bin-dir target/x86_64-unknown-linux-musl/release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+  publish:
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-linux-x86_64
+          path: dist
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; preserving its published assets."
+          else
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --title "Day Chime $RELEASE_TAG" --generate-notes
+          fi

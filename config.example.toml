@@ -1,0 +1,11 @@
+# ~/.config/day-chime/config.toml (platform config directory on macOS/Windows)
+source = "browser"
+browser_url = "https://example.daouoffice.com/home"
+# One valid check-in per working day is sufficient; Brave may then be closed.
+# Legacy browser_max_age_seconds is accepted but no longer used.
+timezone = "Asia/Seoul"
+work_minutes = 480
+break_minutes = 60
+poll_seconds = 300 # API source polling; browser snapshots checked every 5 seconds.
+# Optional legacy API source only: source="api", login_id="your_login_id".
+# API credentials come only from DAOU_CLIENT_ID and DAOU_CLIENT_SECRET.

@@ -1,0 +1,29 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - name: Rust checks
+        run: |
+          cargo fmt --check
+          cargo test --locked
+          cargo clippy --all-targets --locked -- -D warnings
+      - name: Browser and installer checks
+        run: |
+          node --test extension/tests/*.test.cjs
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+          sh -n install.sh scripts/package-release.sh
