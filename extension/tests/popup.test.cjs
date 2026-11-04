@@ -9,7 +9,7 @@ function popup(statuses = [saved], {refreshResponse, preferencesResponse, errorK
   class Clock extends Date { constructor(...args) { super(...(args.length ? args : [clock])); } static now() { return clock; } }
   const nodes = Object.fromEntries(["#version", "#status", "#attendance", "#attendance-date", "#time", "#refresh", "#auto-collect", "#polling-interval", "#save-settings", "#settings-feedback"].map((key) => [key, {textContent: "", hidden: false, disabled: false, checked: true, value: "15", attrs: {}, events: {}, setAttribute(name, value) { this.attrs[name] = value; }, addEventListener(name, fn) { this.events[name] = fn; }}]));
   const calls = [], timers = new Map(); let nextTimer = 1, last = statuses[0];
-  const chrome = {runtime: {lastError: null, getManifest() { return {version: "0.4.1"}; }, sendMessage(message, callback) {
+  const chrome = {runtime: {lastError: null, getManifest() { return {version: "0.4.2"}; }, sendMessage(message, callback) {
     calls.push(message); if (message.kind === deferKind) return; this.lastError = message.kind === errorKind ? {message: "disconnected"} : null;
     let reply;
     if (message.kind === "status") { last = statuses.shift() ?? last; reply = last; }
@@ -51,7 +51,7 @@ test("failed preference save restores actual toggle instead of presenting a fals
 
 test("independent watchdog releases refresh even when callback never arrives", () => {
   const h = popup([saved], {deferKind: "refresh"});
-  assert.equal(h.nodes["#version"].textContent, "v0.4.1");
+  assert.equal(h.nodes["#version"].textContent, "v0.4.2");
   h.click("#refresh"); h.tick(70_000);
   assert.equal(h.nodes["#refresh"].disabled, false); assert.equal(h.nodes["#attendance"].textContent, "09:50"); assert.match(h.nodes["#status"].textContent, /지연/);
 });

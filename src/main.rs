@@ -1,4 +1,5 @@
 mod config_reload;
+mod update;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -38,6 +39,8 @@ enum Command {
     Check,
     NotifyTest,
     BrowserHost,
+    /// Update the daemon, native host and installed browser extension.
+    Update(update::Options),
 }
 
 fn api_for(config: &Config) -> Result<Option<Api>> {
@@ -116,6 +119,9 @@ impl ErrorLog {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if let Command::Update(options) = &args.command {
+        return update::run(options, args.config.as_deref(), args.state_dir.as_deref());
+    }
     if matches!(args.command, Command::NotifyTest) {
         return day_chime::notify("day-chime 데스크톱 알림 테스트입니다.");
     }

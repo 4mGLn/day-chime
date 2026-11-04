@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Day Chime — 근태 읽기",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "다우오피스 홈의 출퇴근 시각만 로컬 Day Chime에 전달합니다.",
   "permissions": [
     "nativeMessaging",
