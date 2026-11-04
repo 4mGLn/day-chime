@@ -1,3 +1,4 @@
+# Valid file changes are applied while running; invalid edits keep the last good settings.
 # ~/.config/day-chime/config.toml (platform config directory on macOS/Windows)
 source = "browser"
 browser_url = "https://example.daouoffice.com/home"

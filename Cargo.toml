@@ -1,6 +1,6 @@
 [package]
 name = "day-chime"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 default-run = "day-chime"
 description = "DaouOffice attendance based desktop reminder"

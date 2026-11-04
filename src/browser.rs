@@ -12,7 +12,7 @@ use std::{
 
 const MAX_MESSAGE: usize = 65_536;
 pub const SNAPSHOT_FILE: &str = "browser-attendance.json";
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
     schema_version: u8,
@@ -29,10 +29,19 @@ pub struct Snapshot {
 fn yes() -> bool {
     true
 }
+#[derive(Clone, Deserialize, Serialize)]
+struct Archived {
+    snapshot: Snapshot,
+    received_at: DateTime<Utc>,
+}
 #[derive(Deserialize, Serialize)]
 struct Stored {
     snapshot: Snapshot,
     received_at: DateTime<Utc>,
+    // The top-level legacy record stays readable by older hosts. One other workday
+    // is enough: configured shifts cannot exceed 24 hours.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    previous: Vec<Archived>,
 }
 
 pub fn validate_source_url(value: &str) -> Result<()> {
@@ -121,12 +130,22 @@ pub fn write_message(writer: &mut impl Write, payload: &serde_json::Value) -> Re
 }
 
 fn save_message(bytes: &[u8], config: &Config, directory: &Path) -> Result<()> {
+    save_message_at(bytes, config, directory, Utc::now())
+}
+fn save_message_at(
+    bytes: &[u8],
+    config: &Config,
+    directory: &Path,
+    now: DateTime<Utc>,
+) -> Result<()> {
     let snapshot: Snapshot = serde_json::from_slice(bytes).context("invalid snapshot JSON")?;
     validate(&snapshot, config)?;
-    let stored = Stored {
+    let mut stored = Stored {
         snapshot,
-        received_at: Utc::now(),
+        received_at: now,
+        previous: Vec::new(),
     };
+    validate_receipt(&stored, config, now)?;
     std::fs::create_dir_all(directory)?;
     #[cfg(unix)]
     {
@@ -139,20 +158,46 @@ fn save_message(bytes: &[u8], config: &Config, directory: &Path) -> Result<()> {
         .write(true)
         .open(directory.join("browser-host.lock"))?;
     lock.lock_exclusive()?;
-    // A missing widget or logged-out page is a collection failure, not evidence
-    // that a previously observed check-in was cancelled.
-    if !stored.snapshot.available {
-        if let Ok(bytes) = std::fs::read(directory.join(SNAPSHOT_FILE)) {
-            if bytes.len() <= MAX_MESSAGE + 1024 {
-                if let Ok(previous) = serde_json::from_slice::<Stored>(&bytes) {
-                    if previous.snapshot.available && validate(&previous.snapshot, config).is_ok() {
-                        return Ok(());
+    let zone = config.validate()?;
+    let today = now.with_timezone(&zone).date_naive();
+    let yesterday = today.pred_opt().context("date underflow")?;
+    if let Ok(bytes) = std::fs::read(directory.join(SNAPSHOT_FILE)) {
+        if bytes.len() <= MAX_MESSAGE + 1024 {
+            if let Ok(previous) = serde_json::from_slice::<Stored>(&bytes) {
+                if previous.previous.len() <= 1 {
+                    let mut records = vec![Archived {
+                        snapshot: previous.snapshot,
+                        received_at: previous.received_at,
+                    }];
+                    records.extend(previous.previous);
+                    for record in records {
+                        let day = record.snapshot.working_day;
+                        if !record.snapshot.available
+                            || validate(&record.snapshot, config).is_err()
+                            || validate_record_receipt(
+                                &record.snapshot,
+                                record.received_at,
+                                config,
+                                now,
+                            )
+                            .is_err()
+                            || !matches!(day, Some(day) if day == today || day == yesterday)
+                        {
+                            continue;
+                        }
+                        // Unavailable is not a correction. Keep the complete atomic
+                        // file, including its original receipt times and overnight record.
+                        if !stored.snapshot.available {
+                            return Ok(());
+                        }
+                        if day != stored.snapshot.working_day && stored.previous.is_empty() {
+                            stored.previous.push(record);
+                        }
                     }
                 }
             }
         }
     }
-    validate_receipt(&stored, config, stored.received_at)?;
     let temporary = directory.join("browser-attendance.tmp");
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -186,14 +231,77 @@ pub fn host(
     Ok(())
 }
 
+/// A persistent native host accepts a changed configuration before each frame.
+/// Invalid intermediate edits keep the last fully validated configuration.
+pub fn host_reloading(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    mut config: Config,
+    initial_contents: &[u8],
+    config_path: &Path,
+    directory: &Path,
+) -> Result<()> {
+    let mut required_fields = crate::config_document::parse(initial_contents)?.fields;
+    let mut last_contents = Some(String::from_utf8(initial_contents.to_vec())?);
+    let mut config_error = false;
+    while let Some(message) = read_message(reader)? {
+        let reload = std::fs::read_to_string(config_path);
+        match reload {
+            Ok(contents) if last_contents.as_deref() != Some(contents.as_str()) => {
+                let candidate =
+                    crate::config_document::parse_reload(contents.as_bytes(), &required_fields);
+                last_contents = Some(contents);
+                match candidate {
+                    Ok(candidate) => {
+                        config = candidate.config;
+                        required_fields = candidate.fields;
+                        config_error = false;
+                    }
+                    Err(_) => {
+                        if !config_error {
+                            eprintln!(
+                                "browser host configuration invalid; keeping previous settings"
+                            );
+                        }
+                        config_error = true;
+                    }
+                }
+            }
+            Err(_) => {
+                // Retry even when the same valid contents reappear after an atomic edit.
+                last_contents = None;
+                if !config_error {
+                    eprintln!("browser host configuration unavailable; keeping previous settings");
+                }
+                config_error = true;
+            }
+            _ => {}
+        }
+        let result = save_message(&message, &config, directory);
+        write_message(writer, &serde_json::json!({"ok":result.is_ok()}))?;
+        if result.is_err() {
+            eprintln!("browser snapshot rejected; verify extension and configuration");
+        }
+    }
+    Ok(())
+}
+
 fn validate_receipt(stored: &Stored, config: &Config, now: DateTime<Utc>) -> Result<()> {
-    if stored.received_at > now + Duration::seconds(30) {
+    validate_record_receipt(&stored.snapshot, stored.received_at, config, now)
+}
+fn validate_record_receipt(
+    snapshot: &Snapshot,
+    received_at: DateTime<Utc>,
+    config: &Config,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    if received_at > now + Duration::seconds(30) {
         bail!("browser receipt is in the future");
     }
-    if stored.snapshot.available {
+    if snapshot.available {
         let zone = config.validate()?;
-        let received_day = stored.received_at.with_timezone(&zone).date_naive();
-        let day = stored.snapshot.working_day.context("missing working_day")?;
+        let received_day = received_at.with_timezone(&zone).date_naive();
+        let day = snapshot.working_day.context("missing working_day")?;
         if day != received_day && Some(day) != received_day.pred_opt() {
             bail!("browser working day does not match its local receipt date");
         }
@@ -213,18 +321,63 @@ pub fn current_schedule(
         bail!("browser snapshot file too large");
     }
     let stored: Stored = serde_json::from_slice(&bytes).context("invalid browser snapshot file")?;
+    if stored.previous.len() > 1 {
+        bail!("too many archived browser records");
+    }
     validate(&stored.snapshot, config)?;
     validate_receipt(&stored, config, now)?;
-    let snapshot = stored.snapshot;
-    if !snapshot.available {
-        return Ok(None);
-    }
     let zone = config.validate()?;
     let today = now.with_timezone(&zone).date_naive();
-    let day = snapshot.working_day.context("missing working_day")?;
-    if day != today && day != today.pred_opt().context("date underflow")? {
-        bail!("browser snapshot has an outdated or future working day");
+    let yesterday = today.pred_opt().context("date underflow")?;
+    let mut records = vec![Archived {
+        snapshot: stored.snapshot,
+        received_at: stored.received_at,
+    }];
+    records.extend(stored.previous);
+    let mut fresh_record = false;
+    let mut expired_record = false;
+    for record in &records {
+        validate(&record.snapshot, config)?;
+        validate_record_receipt(&record.snapshot, record.received_at, config, now)?;
+        if record.snapshot.available {
+            let day = record.snapshot.working_day.context("missing working_day")?;
+            if day > today {
+                bail!("browser snapshot has a future working day");
+            }
+            if day == today || day == yesterday {
+                fresh_record = true;
+            } else {
+                expired_record = true;
+            }
+        }
     }
+    if expired_record && !fresh_record {
+        bail!("browser snapshot has an outdated working day");
+    }
+    // A real check-in/out today supersedes yesterday. Today's empty record does
+    // not erase an active overnight shift; a correction for its own day does.
+    let record = records
+        .iter()
+        .find(|r| {
+            r.snapshot.available
+                && r.snapshot.working_day == Some(today)
+                && (r.snapshot.clock_in.is_some() || r.snapshot.clock_out.is_some())
+        })
+        .or_else(|| {
+            records
+                .iter()
+                .find(|r| r.snapshot.available && r.snapshot.working_day == Some(yesterday))
+        })
+        .or_else(|| {
+            records
+                .iter()
+                .find(|r| r.snapshot.available && r.snapshot.working_day == Some(today))
+        });
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    let snapshot = &record.snapshot;
+    let day = snapshot.working_day.context("missing working_day")?;
     if snapshot.clock_out.is_some() {
         return Ok(None);
     }
@@ -538,5 +691,307 @@ mod tests {
             Duration::minutes(1)
         );
         assert_eq!(after.key, before.key);
+    }
+    fn save_at(directory: &Path, payload: &serde_json::Value, at: &str) -> Result<()> {
+        save_message_at(
+            &serde_json::to_vec(payload)?,
+            &Config::default(),
+            directory,
+            at.parse()?,
+        )
+    }
+    fn dated(day: &str, start: Option<&str>, end: Option<&str>) -> serde_json::Value {
+        let mut payload = snapshot();
+        payload["working_day"] = day.into();
+        payload["clock_in"] = start.into();
+        payload["clock_out"] = end.into();
+        payload
+    }
+    #[test]
+    fn overnight_survives_new_day_empty_record_and_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let at = "2026-11-03T16:00:00Z";
+        // Migrate the legacy single-record format as part of the next save.
+        store(
+            directory.path(),
+            dated("2026-11-03", Some("18:00:00"), None),
+            "2026-11-03T09:00:00Z",
+        );
+        save_at(directory.path(), &dated("2026-11-04", None, None), at).unwrap();
+        let bytes = std::fs::read(directory.path().join(SNAPSHOT_FILE)).unwrap();
+        let stored: Stored = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(stored.previous.len(), 1);
+        assert_eq!(
+            stored.previous[0].received_at.to_rfc3339(),
+            "2026-11-03T09:00:00+00:00"
+        );
+        // Both calls read persisted storage from scratch, including after the due time.
+        for now in [at, "2026-11-03T20:00:00Z"] {
+            let schedule =
+                current_schedule(directory.path(), &Config::default(), now.parse().unwrap())
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(schedule.due.to_rfc3339(), "2026-11-03T18:00:00+00:00");
+            assert!(schedule.key.ends_with(":2026-11-03"));
+        }
+        let mut unavailable = dated("2026-11-04", None, None);
+        unavailable["available"] = false.into();
+        save_at(directory.path(), &unavailable, at).unwrap();
+        assert_eq!(
+            std::fs::read(directory.path().join(SNAPSHOT_FILE)).unwrap(),
+            bytes
+        );
+        assert!(current_schedule(
+            directory.path(),
+            &Config::default(),
+            "2026-11-04T16:00:00Z".parse().unwrap()
+        )
+        .unwrap()
+        .is_none());
+    }
+    #[test]
+    fn yesterday_correction_clears_preserved_shift_and_today_actual_has_priority() {
+        let at = "2026-11-03T16:00:00Z";
+        for correction in [
+            dated("2026-11-03", None, None),
+            dated("2026-11-03", Some("18:00:00"), Some("23:00:00")),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            save_at(
+                directory.path(),
+                &dated("2026-11-03", Some("18:00:00"), None),
+                "2026-11-03T09:00:00Z",
+            )
+            .unwrap();
+            save_at(directory.path(), &dated("2026-11-04", None, None), at).unwrap();
+            save_at(directory.path(), &correction, at).unwrap();
+            assert!(
+                current_schedule(directory.path(), &Config::default(), at.parse().unwrap())
+                    .unwrap()
+                    .is_none()
+            );
+            save_at(
+                directory.path(),
+                &dated("2026-11-04", Some("00:30:00"), None),
+                at,
+            )
+            .unwrap();
+            // A later correction for yesterday must not supersede today's real shift.
+            save_at(directory.path(), &correction, at).unwrap();
+            let current =
+                current_schedule(directory.path(), &Config::default(), at.parse().unwrap())
+                    .unwrap()
+                    .unwrap();
+            assert!(current.key.ends_with(":2026-11-04"));
+            assert_eq!(current.due.to_rfc3339(), "2026-11-04T00:30:00+00:00");
+            save_at(
+                directory.path(),
+                &dated("2026-11-04", Some("00:30:00"), Some("01:00:00")),
+                at,
+            )
+            .unwrap();
+            assert!(
+                current_schedule(directory.path(), &Config::default(), at.parse().unwrap())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+    #[test]
+    fn aged_latest_correction_does_not_mask_newer_archived_overnight_shift() {
+        let directory = tempfile::tempdir().unwrap();
+        save_at(
+            directory.path(),
+            &dated("2026-11-04", Some("20:00:00"), None),
+            "2026-11-04T11:00:00Z",
+        )
+        .unwrap();
+        // Yesterday's correction arrives last, making it the legacy top-level record.
+        save_at(
+            directory.path(),
+            &dated("2026-11-03", None, None),
+            "2026-11-04T12:00:00Z",
+        )
+        .unwrap();
+        let current = current_schedule(
+            directory.path(),
+            &Config::default(),
+            "2026-11-04T16:00:00Z".parse().unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(current.key.ends_with(":2026-11-04"));
+        assert_eq!(current.due.to_rfc3339(), "2026-11-04T20:00:00+00:00");
+    }
+    #[test]
+    fn archive_prunes_old_days_rejects_bad_receipts_and_never_crosses_company() {
+        let directory = tempfile::tempdir().unwrap();
+        save_at(
+            directory.path(),
+            &dated("2026-11-03", Some("18:00:00"), None),
+            "2026-11-03T09:00:00Z",
+        )
+        .unwrap();
+        save_at(
+            directory.path(),
+            &dated("2026-11-04", None, None),
+            "2026-11-03T16:00:00Z",
+        )
+        .unwrap();
+        let before = std::fs::read(directory.path().join(SNAPSHOT_FILE)).unwrap();
+        for day in ["2026-11-01", "2026-11-05"] {
+            assert!(save_at(
+                directory.path(),
+                &dated(day, None, None),
+                "2026-11-03T16:00:00Z"
+            )
+            .is_err());
+            assert_eq!(
+                std::fs::read(directory.path().join(SNAPSHOT_FILE)).unwrap(),
+                before
+            );
+        }
+        // Repeated dates never grow the archive, and the third day drops day one.
+        for _ in 0..3 {
+            save_at(
+                directory.path(),
+                &dated("2026-11-04", None, None),
+                "2026-11-03T16:00:00Z",
+            )
+            .unwrap();
+        }
+        save_at(
+            directory.path(),
+            &dated("2026-11-05", None, None),
+            "2026-11-04T16:00:00Z",
+        )
+        .unwrap();
+        let stored: Stored =
+            serde_json::from_slice(&std::fs::read(directory.path().join(SNAPSHOT_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(stored.previous.len(), 1);
+        assert_eq!(
+            stored.previous[0].snapshot.working_day.unwrap().to_string(),
+            "2026-11-04"
+        );
+        let other = Config {
+            browser_url: "https://other.daouoffice.com/home".into(),
+            ..Config::default()
+        };
+        let now = "2026-11-04T16:00:00Z".parse().unwrap();
+        assert!(current_schedule(directory.path(), &other, now).is_err());
+        let mut empty = dated("2026-11-05", None, None);
+        empty["source_url"] = other.browser_url.clone().into();
+        save_message_at(
+            &serde_json::to_vec(&empty).unwrap(),
+            &other,
+            directory.path(),
+            now,
+        )
+        .unwrap();
+        let mut stored: Stored =
+            serde_json::from_slice(&std::fs::read(directory.path().join(SNAPSHOT_FILE)).unwrap())
+                .unwrap();
+        assert!(stored.previous.is_empty());
+        assert!(current_schedule(directory.path(), &other, now)
+            .unwrap()
+            .is_none());
+        let archive = Archived {
+            snapshot: serde_json::from_value(empty).unwrap(),
+            received_at: now + Duration::hours(1),
+        };
+        stored.previous.push(archive.clone());
+        std::fs::write(
+            directory.path().join(SNAPSHOT_FILE),
+            serde_json::to_vec(&stored).unwrap(),
+        )
+        .unwrap();
+        assert!(current_schedule(directory.path(), &other, now).is_err());
+        stored.previous.push(archive);
+        std::fs::write(
+            directory.path().join(SNAPSHOT_FILE),
+            serde_json::to_vec(&stored).unwrap(),
+        )
+        .unwrap();
+        assert!(current_schedule(directory.path(), &other, now).is_err());
+    }
+    #[test]
+    fn persistent_host_reloads_valid_config_and_keeps_last_good_on_invalid_edit() {
+        use std::collections::VecDeque;
+        struct ChangingReader {
+            config: std::path::PathBuf,
+            frames: VecDeque<(String, Vec<u8>)>,
+            active: std::io::Cursor<Vec<u8>>,
+        }
+        impl Read for ChangingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                if self.active.position() as usize == self.active.get_ref().len() {
+                    let Some((settings, frame)) = self.frames.pop_front() else {
+                        return Ok(0);
+                    };
+                    std::fs::write(&self.config, settings)?;
+                    self.active = std::io::Cursor::new(frame);
+                }
+                self.active.read(buffer)
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut payload = snapshot();
+        payload["working_day"] = Utc::now()
+            .with_timezone(&chrono_tz::Asia::Seoul)
+            .date_naive()
+            .to_string()
+            .into();
+        let mut other = payload.clone();
+        other["source_url"] = "https://other.daouoffice.com/home".into();
+        let frames = VecDeque::from([
+            (
+                "browser_url = 'https://example.daouoffice.com/home'".into(),
+                frame(&payload),
+            ),
+            (
+                "browser_url = 'https://other.daouoffice.com/home'".into(),
+                frame(&other),
+            ),
+            ("work_minutes = 0".into(), frame(&other)),
+            ("".into(), frame(&other)),
+            ("# being saved".into(), frame(&other)),
+            // This is valid TOML, but omits the previously explicit browser_url.
+            ("source = 'browser'".into(), frame(&other)),
+            (
+                "browser_url = 'https://other.daouoffice.com/home'".into(),
+                frame(&payload),
+            ),
+            (
+                "browser_url = 'https://example.daouoffice.com/home'".into(),
+                frame(&payload),
+            ),
+        ]);
+        let mut reader = ChangingReader {
+            config: path.clone(),
+            frames,
+            active: std::io::Cursor::new(Vec::new()),
+        };
+        let mut output = Vec::new();
+        host_reloading(
+            &mut reader,
+            &mut output,
+            Config::default(),
+            b"browser_url = 'https://example.daouoffice.com/home'",
+            &path,
+            directory.path(),
+        )
+        .unwrap();
+        let mut output = output.as_slice();
+        let mut acks = Vec::new();
+        while let Some(bytes) = read_message(&mut output).unwrap() {
+            acks.push(
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["ok"]
+                    .as_bool()
+                    .unwrap(),
+            );
+        }
+        assert_eq!(acks, [true, true, true, true, true, true, false, true]);
     }
 }

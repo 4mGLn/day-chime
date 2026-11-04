@@ -5,27 +5,47 @@
   <title>Day Chime</title>
   <link rel="icon" type="image/png" href="icons/icon-128.png">
   <style>
-    body{font:14px system-ui,sans-serif;width:300px;margin:0;padding:20px;line-height:1.65;color:#29233c;background:#fffaf3}
-    header{display:flex;align-items:center;gap:12px;margin-bottom:18px}
-    header img{width:48px;height:48px;flex:none}
-    h1{font-size:20px;line-height:1.2;margin:0;letter-spacing:-.4px}
-    .tagline{font-size:12px;color:#786b79;margin:4px 0 0}
-    .status-card{padding:14px;border:1px solid #f2ddc2;border-radius:14px;background:#fff}
-    #status{margin:0 0 6px;overflow-wrap:anywhere}
-    small{font-size:11px;color:#786b79}
-    .help{font-size:12px;color:#695e6c;margin:16px 0 0}
+    body{font:14px system-ui,sans-serif;width:320px;margin:0;padding:20px;line-height:1.65;color:#29233c;background:#fffaf3}
+    header{display:flex;align-items:center;gap:10px;margin-bottom:18px}header img{width:44px;height:44px;flex:none}.brand{flex:1}
+    h1{font-size:20px;line-height:1.2;margin:0;letter-spacing:-.4px}.tagline{font-size:11px;color:#786b79;margin:4px 0 0}
+    #refresh{width:36px;height:36px;border:1px solid #efd8b9;border-radius:11px;background:#fff;color:#654579;display:grid;place-items:center;cursor:pointer;flex:none}
+    #refresh:hover{background:#fff0d8}#refresh:focus-visible,button:focus-visible,input:focus-visible{outline:3px solid #bd8d55;outline-offset:2px}#refresh:disabled{opacity:.6;cursor:wait}#refresh svg{width:19px;height:19px}
+    #refresh[aria-busy="true"] svg{animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){#refresh[aria-busy="true"] svg{animation:none}}
+    .attendance-card{padding:14px 16px;margin:0 0 12px;border:1px solid #f0d3a8;border-radius:14px;background:#fff0d8}.label{font-size:12px;font-weight:650;color:#69526c;margin:0}
+    #attendance{font-size:34px;line-height:1.25;font-weight:750;letter-spacing:-1px;font-variant-numeric:tabular-nums;margin:5px 0;color:#352144}#attendance-date{font-size:11px;color:#786b79;margin:0;line-height:1.5}
+    .status-card{padding:13px;border:1px solid #f2ddc2;border-radius:14px;background:#fff}#status{margin:0 0 6px;overflow-wrap:anywhere}small{font-size:11px;color:#786b79}
+    .switch{position:relative;display:inline-flex;width:62px;height:32px;flex:none}
+    .switch input{position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;cursor:pointer;z-index:1}
+    .switch-track{position:absolute;inset:0;border:1px solid #9b8d9e;border-radius:18px;background:#eee8ee;transition:background .18s,border-color .18s}
+    .switch-track::before{content:"";position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;background:#fff;box-shadow:0 1px 3px #35214433;transition:transform .18s}
+    .switch-track::after{content:"OFF";position:absolute;right:6px;top:5px;font-size:10px;line-height:20px;font-weight:750;color:#695e6c}
+    .switch input:checked + .switch-track{background:#654579;border-color:#654579}
+    .switch input:checked + .switch-track::before{transform:translateX(30px)}
+    .switch input:checked + .switch-track::after{content:"ON";left:8px;right:auto;color:#fff}
+    .switch input:focus-visible + .switch-track{outline:3px solid #bd8d55;outline-offset:3px}
+    .switch input:disabled{cursor:wait}.switch input:disabled + .switch-track{opacity:.55}
+    @media(prefers-reduced-motion:reduce){.switch-track,.switch-track::before{transition:none}}
+    .settings{margin-top:14px;padding-top:12px;border-top:1px solid #efdfcb}.toggle{display:flex;justify-content:space-between;align-items:center;font-weight:600}.interval{display:flex;align-items:center;gap:8px;margin-top:9px}.interval input{width:60px;padding:5px;border:1px solid #dbc9b7;border-radius:7px;font:inherit}.interval button{margin-left:auto;padding:6px 11px;border:1px solid #dbc9b7;border-radius:8px;background:#fff;font:inherit;cursor:pointer}.help{font-size:11px;color:#695e6c;margin:10px 0 0}#settings-feedback{font-size:11px;color:#654579;margin:6px 0 0;min-height:18px}
   </style>
 </head>
 <body>
   <header>
-    <img src="icons/icon-128.png" width="48" height="48" alt="">
-    <div><h1>Day Chime</h1><p class="tagline">하루의 시작과 마무리를 가볍게</p></div>
+    <img src="icons/icon-128.png" width="44" height="44" alt="">
+    <div class="brand"><h1>Day Chime</h1><p class="tagline">하루의 시작과 마무리를 가볍게</p></div>
+    <button id="refresh" type="button" title="출근 기록 새로고침" aria-label="출근 기록 새로고침" aria-busy="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 7.5A7 7 0 0 1 18.9 8L20 12M4 12l1.1 4A7 7 0 0 0 17.9 16.5"/></svg></button>
   </header>
-  <section class="status-card" aria-label="연결 상태">
-    <p id="status" role="status">연결 상태를 확인하고 있습니다.</p>
-    <small id="time"></small>
+  <section class="attendance-card" aria-label="출근 시간">
+    <p class="label">출근 시간</p><p id="attendance">--:--</p><p id="attendance-date">기록이 아직 없어요. 오른쪽 위 새로고침을 눌러 주세요.</p>
   </section>
-  <p class="help">Brave 시작 시 오늘 출근 기록을 자동 확인합니다. 출근 확인 알림을 받으면 Brave를 닫아도 됩니다. 로그인 만료 시에는 직접 로그인해 주세요.</p>
+  <section class="status-card" aria-label="연결 상태"><p id="status" role="status">연결 상태를 확인하고 있습니다.</p><small id="time"></small></section>
+  <section class="settings" aria-label="수집 설정">
+    <label class="toggle" for="auto-collect">자동 수집<span class="switch"><input id="auto-collect" type="checkbox" role="switch" aria-label="자동 수집" checked><span class="switch-track" aria-hidden="true"></span></span></label>
+    <div class="interval"><label for="polling-interval">조회 간격</label><input id="polling-interval" type="number" min="1" max="1440" step="1" value="15" aria-describedby="interval-help"><span>분</span><button id="save-settings" type="button">저장</button></div>
+    <p id="interval-help" class="help">오늘 출근 기록을 받기 전까지 이 간격으로 조회해요. 자동 수집을 꺼도 위의 새로고침은 사용할 수 있어요.</p>
+    <p id="settings-feedback" role="status"></p>
+  </section>
+  <p class="help">출근 확인 알림을 받으면 Brave를 닫아도 됩니다. 로그인 만료 시에는 직접 로그인해 주세요.</p>
+  <small id="version"></small>
   <script src="popup.js"></script>
 </body>
 </html>

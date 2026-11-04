@@ -161,3 +161,118 @@ test("rehydrated worker repairs a missing cleanup alarm for its still-owned sess
   const b = background({session, tabs: new Map([[20, {id: 20, active: false}]])}); await b.drain();
   assert.equal(b.created.length, 0); assert.equal(b.alarms.get(CLOSE).when, session.owned_tab.opened_at + 60_000);
 });
+
+test("successful clock-in metadata survives worker restart and is not advertised after native failure", async () => {
+  const local = {}; const original = background({local}); await original.send();
+  const restarted = background({local});
+  const status = await restarted.send({kind: "status"}, {id: restarted.sender.id});
+  assert.equal(status.clock_in, "09:50:00"); assert.equal(status.working_day, "2026-11-03");
+  const failed = background({nativeError: {message: "offline"}}); await failed.send();
+  assert.equal(failed.local.status.clock_in, undefined); assert.equal(failed.local.status.working_day, undefined);
+});
+test("updating a legacy successful status refreshes clock metadata once without polling on worker wake", async () => {
+  const local = {last_success_day: "2026-11-03", last_attempt_at: Date.parse("2026-11-03T01:59:59Z"), status: {ok: true, message: "오늘 출근 기록을 저장했습니다."}};
+  const b = background({local}); await b.drain(); assert.equal(b.created.length, 0);
+  b.chrome.runtime.onInstalled.emit(); await b.drain(); assert.equal(b.created.length, 1);
+  await b.send(message(), {...b.sender, tab: {id: 100, url: reader.SOURCE}});
+  b.chrome.runtime.onInstalled.emit(); await b.drain(); assert.equal(b.created.length, 1);
+  const restarted = background({local}); await restarted.drain(); assert.equal(restarted.created.length, 0);
+});
+
+test("popup manual refresh bypasses daily success cooldown and login pause but reuses pending tab", async () => {
+  const b = background({local: {last_success_day: "2026-11-03", last_attempt_at: Date.parse("2026-11-03T02:00:00Z"), login_required: true}});
+  const ui = {id: b.sender.id};
+  const reply = await b.send({kind: "refresh"}, ui);
+  assert.equal(reply.accepted, true); assert.equal(reply.status.refreshing, true); assert.equal(b.created.length, 1); assert.equal(b.created[0].active, false);
+  await b.send({kind: "refresh"}, ui); assert.equal(b.created.length, 1);
+  await b.send(message(), {...b.sender, tab: {id: 100, url: reader.SOURCE}});
+  const status = await b.send({kind: "status"}, ui);
+  assert.equal(status.refreshing, false); assert.equal(status.clock_in, "09:50:00"); assert.deepEqual(b.removed, [100]);
+});
+test("content and foreign senders cannot request popup controls", async () => {
+  const b = background();
+  for (const kind of ["refresh", "set-preferences"]) {
+    b.chrome.runtime.onMessage.emit({kind}, b.sender, () => assert.fail("webpage request accepted"));
+    b.chrome.runtime.onMessage.emit({kind}, {id: "foreign"}, () => assert.fail("foreign request accepted"));
+  }
+  await b.drain(); assert.equal(b.created.length, 0);
+});
+test("last confirmed clock survives transient failure and valid no-clock correction clears it", async () => {
+  const b = background(); await b.send();
+  await b.send(message({available: false, clock_in: null, working_day: null}));
+  let status = await b.send({kind: "status"}, {id: b.sender.id});
+  assert.equal(status.ok, false); assert.equal(status.clock_in, "09:50:00");
+  await b.send(message({clock_in: null}));
+  status = await b.send({kind: "status"}, {id: b.sender.id});
+  assert.equal(status.clock_in, undefined); assert.equal(b.local.last_attendance, undefined);
+});
+test("auto OFF persists across worker restart blocks background and content but permits manual tab", async () => {
+  const local = {}; const b = background({local});
+  const prefs = await b.send({kind: "set-preferences", auto_collect_enabled: false, polling_interval_minutes: 3}, {id: b.sender.id});
+  assert.equal(prefs.accepted, true); assert.equal(b.alarms.has(DAILY), false);
+  const next = background({local}); next.chrome.runtime.onStartup.emit(); next.chrome.alarms.onAlarm.emit({name: DAILY}); await next.drain();
+  assert.equal(next.created.length, 0);
+  assert.equal((await next.send({kind: "collection-config"})).enabled, false);
+  assert.equal((await next.send()).paused, true); assert.equal(next.calls.length, 0);
+  await next.send({kind: "refresh"}, {id: next.sender.id});
+  const owned = {...next.sender, tab: {id: 100, url: reader.SOURCE}};
+  assert.equal((await next.send({kind: "collection-config"}, owned)).enabled, true);
+  assert.equal((await next.send(message(), owned)).ok, true); assert.equal(next.local.last_attendance.clock_in, "09:50:00");
+});
+test("settings reschedule alarm cooldown and disable only an owned automatic tab", async () => {
+  const b = background(); b.chrome.runtime.onStartup.emit(); await b.drain();
+  await b.send({kind: "set-preferences", auto_collect_enabled: false, polling_interval_minutes: 2}, {id: b.sender.id});
+  assert.deepEqual(b.removed, [100]); assert.equal(b.alarms.has(DAILY), false);
+  await b.send({kind: "refresh"}, {id: b.sender.id});
+  await b.send({kind: "set-preferences", auto_collect_enabled: false, polling_interval_minutes: 2}, {id: b.sender.id});
+  assert.deepEqual(b.removed, [100]); assert.equal(b.session.owned_tab.manual, true);
+  b.advance(60_000); b.chrome.alarms.onAlarm.emit({name: CLOSE}); await b.drain();
+  assert.match(b.local.status.message, /새로고침/); assert.doesNotMatch(b.local.status.message, /분 후/);
+  await b.send({kind: "set-preferences", auto_collect_enabled: true, polling_interval_minutes: 2}, {id: b.sender.id});
+  assert.equal(b.alarms.get(DAILY).periodInMinutes, 2);
+  b.advance(60_000); b.chrome.alarms.onAlarm.emit({name: DAILY}); await b.drain(); assert.equal(b.created.length, 3);
+});
+test("invalid interval settings do not modify stored preferences and corrupt stored values use defaults", async () => {
+  const local = {auto_collect_enabled: false, polling_interval_minutes: 4}; const b = background({local});
+  for (const value of [0, 1441, 1.5, "3", null]) {
+    assert.equal((await b.send({kind: "set-preferences", auto_collect_enabled: true, polling_interval_minutes: value}, {id: b.sender.id})).accepted, false);
+    assert.equal(local.auto_collect_enabled, false); assert.equal(local.polling_interval_minutes, 4);
+  }
+  const corrupt = background({local: {auto_collect_enabled: "false", polling_interval_minutes: -1}});
+  const status = await corrupt.send({kind: "status"}, {id: corrupt.sender.id});
+  assert.equal(status.auto_collect_enabled, true); assert.equal(status.polling_interval_minutes, 15);
+});
+test("manual native failure ends owned refresh while keeping confirmed attendance", async () => {
+  const local = {last_attendance: {clock_in: "09:50:00", working_day: "2026-11-03"}};
+  const b = background({local, nativeError: {message: "offline"}});
+  await b.send({kind: "refresh"}, {id: b.sender.id});
+  await b.send(message(), {...b.sender, tab: {id: 100, url: reader.SOURCE}});
+  const status = await b.send({kind: "status"}, {id: b.sender.id});
+  assert.equal(status.refreshing, false); assert.equal(status.clock_in, "09:50:00"); assert.match(status.message, /offline/);
+});
+
+test("legacy clock is migrated before refresh failure or disabling automatic collection", async () => {
+  for (const kind of ["refresh", "set-preferences"]) {
+    const local = {status: {ok: true, clock_in: "09:50:00", working_day: "2026-11-03"}};
+    const b = background({local, nativeError: {message: "offline"}}); const ui = {id: b.sender.id};
+    await b.send({kind, auto_collect_enabled: false, polling_interval_minutes: 15}, ui);
+    assert.equal((await b.send({kind: "status"}, ui)).clock_in, "09:50:00");
+    if (kind === "refresh") await b.send(message(), {...b.sender, tab: {id: 100, url: reader.SOURCE}});
+    assert.equal((await b.send({kind: "status"}, ui)).clock_in, "09:50:00");
+  }
+});
+test("manual refresh promotes pending automatic tab and survives switching automatic collection OFF", async () => {
+  const b = background(); b.chrome.runtime.onStartup.emit(); await b.drain();
+  const opened = b.session.owned_tab.opened_at; const ui = {id: b.sender.id};
+  await b.send({kind: "refresh"}, ui);
+  await b.send({kind: "set-preferences", auto_collect_enabled: false, polling_interval_minutes: 15}, ui);
+  assert.equal(b.created.length, 1); assert.equal(b.removed.length, 0); assert.equal(b.session.owned_tab.manual, true); assert.equal(b.session.owned_tab.opened_at, opened);
+  assert.equal((await b.send(message(), {...b.sender, tab: {id: 100, url: reader.SOURCE}})).ok, true);
+});
+
+test("valid empty correction does not resurrect legacy successful status during migration", async () => {
+  const local = {status: {ok: true, clock_in: "09:50:00", working_day: "2026-11-03"}};
+  const b = background({local}); await b.send(message({clock_in: null}));
+  assert.equal((await b.send({kind: "status"}, {id: b.sender.id})).clock_in, undefined);
+  assert.equal(local.last_attendance, undefined);
+});
