@@ -62,6 +62,21 @@ async function closeOwned(expectedId) {
   await chrome.tabs.remove(owned.id);
   return true;
 }
+async function clearLoginWait() {
+  await chrome.storage.session.remove("login_wait_tab");
+  await chrome.storage.local.set({login_required: false});
+}
+async function waitForLogin(owned) {
+  await releaseOwned();
+  await chrome.storage.session.set({login_wait_tab: {id: owned.id, manual: owned.manual, working_day: today()}});
+  await chrome.storage.local.set({login_required: true});
+  const prefs = await getPreferences();
+  await update(false, prefs.auto_collect_enabled ? `로그인이 필요할 수 있습니다. 로그인 후 근태 화면이 나타나면 다시 수집합니다. ${prefs.polling_interval_minutes}분마다 연결도 다시 확인합니다.` : "로그인 후 근태 화면이 나타나면 다시 수집합니다. 필요하면 새로고침을 다시 눌러 주세요.");
+}
+async function adoptManual(owned) {
+  if (owned.manual) await chrome.storage.session.set({login_wait_tab: {id: owned.id, manual: true, working_day: today()}});
+  await releaseOwned();
+}
 async function ensureAlarm() {
   const prefs = await getPreferences();
   const alarm = await chrome.alarms.get(DAILY_ALARM);
@@ -82,6 +97,12 @@ async function timeoutOwned() {
     await chrome.alarms.create(CLOSE_ALARM, {when: owned.opened_at + 60_000});
     return;
   }
+  // A missing widget may be a login form on /home itself, without a readable URL change.
+  // Preserve the original page; later probes are disposable and cannot accumulate.
+  if (!owned.probe && owned.widget_missing !== false) {
+    await waitForLogin(owned);
+    return;
+  }
   const closed = await closeOwned(owned.id);
   const saved = await chrome.storage.local.get("last_success_day");
   if (closed && (owned.manual || saved.last_success_day !== today())) {
@@ -93,13 +114,22 @@ async function collect({force = false} = {}) {
   const prefs = await getPreferences();
   if (!force && !prefs.auto_collect_enabled) return;
   const saved = await chrome.storage.local.get(["last_success_day", "last_attempt_at", "login_required"]);
-  if (!force && (saved.last_success_day === today() || saved.login_required)) return;
+  let {login_wait_tab: waiting} = await chrome.storage.session.get("login_wait_tab");
+  if (waiting) {
+    try { await chrome.tabs.get(waiting.id); }
+    catch { await clearLoginWait(); waiting = null; }
+  } else if (saved.login_required) {
+    // Older versions persisted an unbounded pause without any tab to recover it.
+    await clearLoginWait();
+  }
+  if (!force && saved.last_success_day === today()
+    && !(waiting?.manual && waiting.working_day === today())) return;
   const {owned_tab: owned} = await chrome.storage.session.get("owned_tab");
   if (owned) {
     try {
       const tab = await chrome.tabs.get(owned.id);
-      if (tab.active) await releaseOwned();
-      else if (Date.now() - owned.opened_at >= 60_000) await closeOwned();
+      if (tab.active) await adoptManual(owned);
+      else if (Date.now() - owned.opened_at >= 60_000) await timeoutOwned();
       else {
         if (force && !owned.manual) await chrome.storage.session.set({owned_tab: {...owned, manual: true}});
         return;
@@ -107,11 +137,21 @@ async function collect({force = false} = {}) {
     } catch { await releaseOwned(); }
   }
   if (!force && Number.isFinite(saved.last_attempt_at) && Date.now() >= saved.last_attempt_at && Date.now() - saved.last_attempt_at < prefs.polling_interval_minutes * 60_000) return;
+  ({login_wait_tab: waiting} = await chrome.storage.session.get("login_wait_tab"));
+  if (waiting && force) {
+    waiting = {id: waiting.id, manual: true, working_day: today()};
+    await chrome.storage.session.set({login_wait_tab: waiting});
+  }
+  if (waiting) {
+    // Messaging does not require access to sensitive tab URLs. If login was a
+    // different document, a single inactive home probe supplies a fresh reader.
+    void chrome.tabs.sendMessage(waiting.id, {kind: "refresh-attendance"}).catch(() => {});
+  }
   // Save the attempt first so failed/restarted workers cannot create a tab flood.
   await chrome.storage.local.set({last_attempt_at: Date.now()});
   const tab = await chrome.tabs.create({url: DayChimeReader.SOURCE, active: false});
   try {
-    await chrome.storage.session.set({owned_tab: {id: tab.id, opened_at: Date.now(), manual: force}});
+    await chrome.storage.session.set({owned_tab: {id: tab.id, opened_at: Date.now(), manual: force, probe: Boolean(waiting)}});
     await chrome.alarms.create(CLOSE_ALARM, {delayInMinutes: 1});
     await update(false, "백그라운드에서 오늘 출근 기록을 확인하고 있습니다.");
   } catch (error) {
@@ -132,6 +172,20 @@ function sendNative(snapshot) {
   });
 }
 async function attendance(snapshot, tabId) {
+  const {owned_tab: owned} = await chrome.storage.session.get("owned_tab");
+  if (owned?.id === tabId) await chrome.storage.session.set({owned_tab: {...owned, widget_missing: !snapshot.available}});
+  const authenticated = snapshot.available && snapshot.working_day === today()
+    && (snapshot.clock_in === null || validAttendance(snapshot));
+  // Authentication recovery is separate from native delivery success: no clock-in
+  // and a temporarily unavailable native host must not leave login paused forever.
+  if (authenticated) {
+    const {login_wait_tab: waiting} = await chrome.storage.session.get("login_wait_tab");
+    const prefs = await getPreferences();
+    if (!prefs.auto_collect_enabled && waiting?.manual && waiting.id === tabId && snapshot.clock_in === null) {
+      await chrome.storage.local.set({login_required: false});
+      await chrome.storage.session.set({login_wait_tab: {...waiting, ready_at: waiting.ready_at ?? Date.now()}});
+    } else await clearLoginWait();
+  }
   await sendNative(snapshot);
   const hasClockIn = snapshot.available && snapshot.working_day === today()
     && typeof snapshot.clock_in === "string" && /^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d$/.test(snapshot.clock_in);
@@ -159,8 +213,10 @@ async function statusView() {
 }
 async function contentConfig(sender) {
   const prefs = await getPreferences();
-  const {owned_tab: owned} = await chrome.storage.session.get("owned_tab");
-  return {enabled: prefs.auto_collect_enabled || Boolean(owned?.manual && owned.id === sender.tab.id && Date.now() < owned.opened_at + 60_000), interval_minutes: prefs.polling_interval_minutes};
+  const {owned_tab: owned, login_wait_tab: waiting} = await chrome.storage.session.get(["owned_tab", "login_wait_tab"]);
+  const pendingManual = waiting?.manual && waiting.id === sender.tab.id && waiting.working_day === today()
+    && (!Number.isFinite(waiting.ready_at) || Date.now() < waiting.ready_at + 60_000);
+  return {enabled: prefs.auto_collect_enabled || Boolean(owned?.manual && owned.id === sender.tab.id && Date.now() < owned.opened_at + 60_000) || Boolean(pendingManual), interval_minutes: prefs.polling_interval_minutes};
 }
 async function setPreferences(message) {
   if (typeof message.auto_collect_enabled !== "boolean" || !Number.isInteger(message.polling_interval_minutes) || message.polling_interval_minutes < 1 || message.polling_interval_minutes > 1440) throw Error("조회 간격은 1~1440분 사이의 정수로 입력해 주세요.");
@@ -186,7 +242,10 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
     }).then(respond, (error) => respond({accepted: false, message: error.message}));
     return true;
   }
-  if (sender.frameId !== 0 || !DayChimeReader.isHome(sender.tab?.url)) return false;
+  // MessageSender.url identifies this frame even when tabs permission does not
+  // expose sender.tab.url. Never accept a conflicting URL from another frame.
+  if (sender.frameId !== 0 || !Number.isInteger(sender.tab?.id) || !DayChimeReader.isHome(sender.url)
+    || (sender.tab.url !== undefined && !DayChimeReader.isHome(sender.tab.url))) return false;
   if (message?.kind === "collection-config") {
     serial(() => contentConfig(sender)).then(respond, () => respond({enabled: false}));
     return true;
@@ -205,7 +264,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
   }).then(respond, async (error) => {
     try {
       const {owned_tab: owned} = await chrome.storage.session.get("owned_tab");
-      if (owned?.manual) await closeOwned(sender.tab.id);
+      if (owned?.manual && (!owned.widget_missing || owned.probe)) await closeOwned(sender.tab.id);
       await update(false, error.message);
     } catch { /* Report request failure even if diagnostic storage failed. */ }
     respond({ok: false});
@@ -214,7 +273,8 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
 });
 chrome.runtime.onStartup.addListener(() => launch(async () => {
   await releaseOwned();
-  await chrome.storage.local.set({login_required: false});
+  await clearLoginWait();
+  await chrome.storage.local.remove("last_attempt_at");
   await ensureAlarm();
   await collect();
 }));
@@ -237,20 +297,23 @@ chrome.alarms.onAlarm.addListener((alarm) => launch(async () => {
 }));
 chrome.tabs.onActivated.addListener(({tabId}) => launch(async () => {
   const {owned_tab: owned} = await chrome.storage.session.get("owned_tab");
-  if (owned?.id === tabId) await releaseOwned();
+  if (owned?.id === tabId) await adoptManual(owned);
 }));
 chrome.tabs.onRemoved.addListener((tabId) => launch(async () => {
-  const {owned_tab: owned} = await chrome.storage.session.get("owned_tab");
+  const {owned_tab: owned, login_wait_tab: waiting} = await chrome.storage.session.get(["owned_tab", "login_wait_tab"]);
   if (owned?.id === tabId) await releaseOwned();
+  if (waiting?.id === tabId) await clearLoginWait();
 }));
 chrome.tabs.onUpdated.addListener((tabId, change) => {
   if (!change.url || DayChimeReader.isHome(change.url)) return;
   launch(async () => {
     const {owned_tab: owned} = await chrome.storage.session.get("owned_tab");
     if (owned?.id !== tabId) return;
-    await releaseOwned();
-    await chrome.storage.local.set({login_required: true});
-    await update(false, "로그인 또는 화면 확인이 필요합니다. 다우오피스 홈을 열어 주세요.");
+    if (owned.probe) {
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (tab?.active) await adoptManual(owned);
+      else await closeOwned(tabId);
+    } else await waitForLogin(owned);
   });
 });
 // Worker rehydration restores scheduling, but does not repeatedly open tabs.

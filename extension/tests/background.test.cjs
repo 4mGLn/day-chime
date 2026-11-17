@@ -6,7 +6,7 @@ const reader = require("../reader.js");
 const SCRIPT = fs.readFileSync(require.resolve("../background.js"), "utf8");
 const DAILY = "day-chime-daily-collection";
 const CLOSE = "day-chime-collection-timeout";
-function event() { const listeners = []; return {addListener: (f) => listeners.push(f), emit: (...args) => listeners.forEach((f) => f(...args))}; }
+function event() { const listeners = []; return {addListener: (f) => listeners.push(f), emit: (...args) => { let value; for (const f of listeners) value = f(...args); return value; }}; }
 function store(data, {failSet = false} = {}) {
   return {
     async get(keys) { return Object.fromEntries((typeof keys === "string" ? [keys] : keys).filter((key) => key in data).map((key) => [key, structuredClone(data[key])])); },
@@ -17,7 +17,7 @@ function store(data, {failSet = false} = {}) {
 function background({nativeError = null, response = {ok: true}, local = {}, session = {}, failLocalSet = false, now = "2026-11-03T02:00:00Z", tabs = new Map(), alarms = new Map()} = {}) {
   let clock = new Date(now).getTime();
   class Clock extends Date { constructor(...args) { super(...(args.length ? args : [clock])); } static now() { return clock; } }
-  const calls = [], badges = [], created = [], removed = [], warnings = [];
+  const calls = [], badges = [], created = [], removed = [], warnings = [], nudged = [];
   let nextId = 100;
   const chrome = {
     runtime: {
@@ -33,6 +33,7 @@ function background({nativeError = null, response = {ok: true}, local = {}, sess
     alarms: {onAlarm: event(), async get(name) { return alarms.get(name); }, async create(name, info) { alarms.set(name, structuredClone(info)); }, async clear(name) { return alarms.delete(name); }},
     tabs: {
       onActivated: event(), onRemoved: event(), onUpdated: event(),
+      async sendMessage(id, message) { nudged.push({id, message}); },
       async create(info) { const id = nextId++; created.push({id, ...structuredClone(info)}); tabs.set(id, {id, active: info.active}); return {id, active: info.active}; },
       async get(id) { if (!tabs.has(id)) throw Error("missing tab"); return structuredClone(tabs.get(id)); },
       async remove(id) { removed.push(id); tabs.delete(id); },
@@ -40,9 +41,9 @@ function background({nativeError = null, response = {ok: true}, local = {}, sess
   };
   vm.runInNewContext(SCRIPT, {chrome, importScripts: () => {}, DayChimeReader: reader, Intl, Date: Clock, console: {warn: (...args) => warnings.push(args)}});
   const drain = async () => { for (let n = 0; n < 8; n++) await new Promise(setImmediate); };
-  const sender = {id: chrome.runtime.id, frameId: 0, tab: {id: 99, url: reader.SOURCE}};
-  const send = (msg = message(), source = sender) => new Promise((resolve) => chrome.runtime.onMessage.emit(msg, source, resolve));
-  return {chrome, calls, badges, created, removed, warnings, tabs, alarms, local, session, sender, send, drain, advance: (ms) => { clock += ms; }};
+  const sender = {id: chrome.runtime.id, frameId: 0, url: reader.SOURCE, tab: {id: 99, url: reader.SOURCE}};
+  const send = (msg = message(), source = sender) => new Promise((resolve) => { if (chrome.runtime.onMessage.emit(msg, source, resolve) === false) resolve(null); });
+  return {chrome, calls, badges, created, removed, warnings, nudged, tabs, alarms, local, session, sender, send, drain, advance: (ms) => { clock += ms; }};
 }
 function message(overrides = {}) {
   return {kind: "attendance", snapshot: {schema_version: 1, source_url: reader.SOURCE, available: true, working_day: "2026-11-03", clock_in: "09:50:00", clock_out: null, observed_at: "2026-11-03T02:00:00Z", ...overrides}};
@@ -122,14 +123,14 @@ test("redirect or user navigation relinquishes ownership and asks for login with
   b.chrome.tabs.onUpdated.emit(100, {url: "https://example.daouoffice.com/login"}); await b.drain();
   assert.equal(b.session.owned_tab, undefined); assert.equal(b.local.login_required, true);
   b.advance(16 * 60_000); b.chrome.alarms.onAlarm.emit({name: CLOSE}); b.chrome.alarms.onAlarm.emit({name: DAILY}); await b.drain();
-  assert.deepEqual(b.removed, []); assert.equal(b.created.length, 1); assert.match(b.local.status.message, /로그인/);
+  assert.deepEqual(b.removed, []); assert.equal(b.created.length, 2); assert.match(b.local.status.message, /백그라운드/);
   await b.send(); assert.equal(b.local.login_required, false);
 });
 test("worker restart retains success and owns only tracked session tab; browser startup clears stale ownership", async () => {
   const local = {last_success_day: "2026-11-03"}, session = {owned_tab: {id: 20, opened_at: Date.parse("2026-11-03T01:58:00Z")}};
   const tabs = new Map([[20, {id: 20, active: false}]]);
   const worker = background({local, session, tabs}); await worker.drain(); worker.chrome.alarms.onAlarm.emit({name: CLOSE}); await worker.drain();
-  assert.deepEqual(worker.removed, [20]); assert.equal(worker.created.length, 0);
+  assert.deepEqual(worker.removed, []); assert.equal(worker.session.login_wait_tab.id, 20); assert.equal(worker.created.length, 0);
   const startup = background({session: {owned_tab: {id: 20, opened_at: 0}}, tabs: new Map([[20, {id: 20, active: false}]])});
   startup.chrome.runtime.onStartup.emit(); await startup.drain(); assert.deepEqual(startup.removed, []); assert.equal(startup.created.length, 1);
 });
@@ -143,13 +144,13 @@ test("an old timeout delivered after a new daily attempt cannot close the fresh 
   const b = background(); b.chrome.runtime.onStartup.emit(); await b.drain();
   b.advance(16 * 60_000);
   b.chrome.alarms.onAlarm.emit({name: DAILY}); b.chrome.alarms.onAlarm.emit({name: CLOSE}); await b.drain();
-  assert.equal(b.created.length, 2); assert.deepEqual(b.removed, [100]); assert.equal(b.session.owned_tab.id, 101);
+  assert.equal(b.created.length, 2); assert.deepEqual(b.removed, []); assert.equal(b.session.owned_tab.id, 101);
   assert.equal(b.alarms.get(CLOSE).when, b.session.owned_tab.opened_at + 60_000);
 });
 test("timed-out collection reports login/retry guidance instead of indefinite loading", async () => {
   const b = background(); b.chrome.runtime.onStartup.emit(); await b.drain(); b.advance(60_000);
   b.chrome.alarms.onAlarm.emit({name: CLOSE}); await b.drain();
-  assert.equal(b.session.owned_tab, undefined); assert.deepEqual(b.removed, [100]); assert.match(b.local.status.message, /ログイン|로그인/); assert.match(b.local.status.message, /15분/);
+  assert.equal(b.session.owned_tab, undefined); assert.deepEqual(b.removed, []); assert.match(b.local.status.message, /로그인/); assert.match(b.local.status.message, /15분/);
 });
 test("explicit no-check-in correction clears the daily success so later collection can retry", async () => {
   const b = background({local: {last_success_day: "2026-11-03"}});
@@ -275,4 +276,132 @@ test("valid empty correction does not resurrect legacy successful status during 
   const b = background({local}); await b.send(message({clock_in: null}));
   assert.equal((await b.send({kind: "status"}, {id: b.sender.id})).clock_in, undefined);
   assert.equal(local.last_attendance, undefined);
+});
+
+
+test("validated frame URL works without sensitive tab URL, and conflicting frame sources are rejected", async () => {
+  const b = background();
+  const sender = {...b.sender, tab: {id: 99}};
+  assert.equal((await b.send({kind: "collection-config"}, sender))?.enabled, true);
+  assert.equal((await b.send(message(), sender)).ok, true);
+  const before = b.calls.length;
+  for (const source of [{...b.sender, url: "https://evil.example/home"}, {...b.sender, url: undefined}, {...b.sender, frameId: 1}]) {
+    b.chrome.runtime.onMessage.emit(message(), source, () => assert.fail("invalid source accepted"));
+  }
+  await b.drain(); assert.equal(b.calls.length, before);
+});
+
+test("long login return with no check-in clears login pause and restarts normal polling", async () => {
+  const b = background(); b.chrome.runtime.onStartup.emit(); await b.drain();
+  b.chrome.tabs.onUpdated.emit(100, {url: "https://example.daouoffice.com/login"}); await b.drain();
+  b.advance(30 * 60_000);
+  assert.equal((await b.send({kind: "collection-config"}, {...b.sender, tab: {id: 100}})).enabled, true);
+  assert.equal((await b.send(message({clock_in: null}), {...b.sender, tab: {id: 100}})).ok, true);
+  assert.equal(b.local.login_required, false);
+  b.chrome.alarms.onAlarm.emit({name: DAILY}); await b.drain(); assert.equal(b.created.length, 2);
+});
+
+test("eventless login timeout preserves page then home attendance recovers without creating another tab", async () => {
+  const b = background(); b.chrome.runtime.onStartup.emit(); await b.drain();
+  await b.send(message({available: false, working_day: null, clock_in: null}), {...b.sender, tab: {id: 100}});
+  b.advance(60_000); b.chrome.alarms.onAlarm.emit({name: CLOSE}); await b.drain();
+  assert.deepEqual(b.removed, []); assert.equal(b.session.owned_tab, undefined);
+  assert.equal(b.session.login_wait_tab.id, 100);
+  b.advance(60_000); b.chrome.alarms.onAlarm.emit({name: DAILY}); await b.drain(); assert.equal(b.created.length, 1);
+  const returned = {...b.sender, tab: {id: 100}};
+  assert.equal((await b.send({kind: "collection-config"}, returned)).enabled, true);
+  assert.equal((await b.send(message(), returned)).ok, true);
+  assert.equal(b.local.login_required, false); assert.equal(b.session.login_wait_tab, undefined);
+  assert.equal(b.local.last_success_day, "2026-11-03"); assert.deepEqual(b.removed, []);
+});
+
+test("closed login page and orphaned legacy pause cannot suppress future attempts forever", async () => {
+  const b = background(); b.chrome.runtime.onStartup.emit(); await b.drain();
+  b.chrome.tabs.onUpdated.emit(100, {url: "https://example.daouoffice.com/login"}); await b.drain();
+  b.tabs.delete(100); b.chrome.tabs.onRemoved.emit(100); await b.drain();
+  b.advance(16 * 60_000); b.chrome.alarms.onAlarm.emit({name: DAILY}); await b.drain(); assert.equal(b.created.length, 2);
+  const old = background({local: {login_required: true, last_attempt_at: 0}});
+  old.chrome.alarms.onAlarm.emit({name: DAILY}); await old.drain(); assert.equal(old.created.length, 1);
+});
+
+test("manual login return stays eligible after activation with auto OFF and never closes user page", async () => {
+  const b = background({local: {auto_collect_enabled: false}}); const ui = {id: b.sender.id};
+  await b.send({kind: "refresh"}, ui);
+  b.tabs.set(100, {id: 100, active: true}); b.chrome.tabs.onActivated.emit({tabId: 100}); await b.drain();
+  b.chrome.tabs.onUpdated.emit(100, {url: "https://example.daouoffice.com/login"}); await b.drain();
+  b.advance(60 * 60_000);
+  const returned = {...b.sender, tab: {id: 100}};
+  assert.equal((await b.send({kind: "collection-config"}, returned)).enabled, true);
+  assert.equal((await b.send(message(), returned)).ok, true);
+  assert.deepEqual(b.removed, []); assert.equal(b.session.login_wait_tab, undefined);
+  assert.equal((await b.send({kind: "collection-config"}, returned)).enabled, false);
+});
+
+test("worker hydration retains login wait but browser startup does not persist dead tab IDs", async () => {
+  const local = {login_required: true, last_attempt_at: Date.parse("2026-11-03T02:00:00Z")}; const session = {login_wait_tab: {id: 20, manual: false, working_day: "2026-11-03"}};
+  const b = background({local, session, tabs: new Map([[20, {id: 20, active: false}]])});
+  b.chrome.alarms.onAlarm.emit({name: DAILY}); await b.drain(); assert.equal(b.created.length, 0);
+  b.chrome.runtime.onStartup.emit(); await b.drain(); assert.equal(b.created.length, 1); assert.equal(b.session.login_wait_tab, undefined);
+});
+
+test("authenticated current-day home clears pause even when native delivery fails", async () => {
+  const b = background({local: {login_required: true}, nativeError: {message: "Native host unavailable"}});
+  assert.equal((await b.send(message({clock_in: null}))).ok, false);
+  assert.equal(b.local.login_required, false); assert.equal(b.local.last_success_day, undefined);
+});
+
+
+test("open login page without any home signal still receives bounded periodic home probes", async () => {
+  const b = background(); b.chrome.runtime.onStartup.emit(); await b.drain();
+  b.advance(60_000); b.chrome.alarms.onAlarm.emit({name: CLOSE}); await b.drain();
+  assert.equal(b.session.login_wait_tab.id, 100); assert.equal(b.tabs.size, 1);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    b.advance(15 * 60_000); b.chrome.alarms.onAlarm.emit({name: DAILY}); await b.drain();
+    assert.equal(b.tabs.size, 2); assert.equal(b.session.owned_tab.probe, true);
+    const probe = b.session.owned_tab.id;
+    if (attempt % 2) {
+      b.chrome.tabs.onUpdated.emit(probe, {url: "https://example.daouoffice.com/login"}); await b.drain();
+    } else {
+      b.advance(60_000); b.chrome.alarms.onAlarm.emit({name: CLOSE}); await b.drain();
+    }
+    assert.equal(b.tabs.size, 1); assert.equal(b.session.login_wait_tab.id, 100); assert.equal(b.tabs.has(100), true);
+  }
+  b.advance(15 * 60_000); b.chrome.alarms.onAlarm.emit({name: DAILY}); await b.drain();
+  const probe = b.session.owned_tab.id;
+  assert.equal((await b.send(message(), {...b.sender, tab: {id: probe}})).ok, true);
+  assert.equal(b.session.login_wait_tab, undefined); assert.equal(b.local.last_success_day, "2026-11-03");
+  assert.equal(b.tabs.size, 1); assert.equal(b.tabs.has(100), true);
+});
+test("auto OFF does not send periodic login probes while manual retry remains available", async () => {
+  const local = {auto_collect_enabled: false}; const session = {login_wait_tab: {id: 20, manual: true, working_day: "2026-11-03"}};
+  const b = background({local, session, tabs: new Map([[20, {id: 20, active: true}]])});
+  b.advance(60 * 60_000); b.chrome.alarms.onAlarm.emit({name: DAILY}); await b.drain(); assert.equal(b.created.length, 0);
+  await b.send({kind: "refresh"}, {id: b.sender.id}); assert.equal(b.created.length, 1); assert.equal(b.session.owned_tab.manual, true);
+});
+test("manual login empty placeholder keeps only a bounded settling read grant", async () => {
+  const local = {auto_collect_enabled: false}; const session = {login_wait_tab: {id: 20, manual: true, working_day: "2026-11-03"}};
+  const b = background({local, session, tabs: new Map([[20, {id: 20, active: true}]])});
+  const sender = {...b.sender, tab: {id: 20}};
+  assert.equal((await b.send(message({clock_in: null}), sender)).ok, true);
+  b.advance(2000); assert.equal((await b.send({kind: "collection-config"}, sender)).enabled, true);
+  b.advance(60_000); assert.equal((await b.send({kind: "collection-config"}, sender)).enabled, false);
+});
+
+test("explicit manual login recovery can probe despite earlier successful daily collection", async () => {
+  const b = background({local: {last_success_day: "2026-11-03"}}); const ui = {id: b.sender.id};
+  await b.send({kind: "refresh"}, ui);
+  b.advance(60_000); b.chrome.alarms.onAlarm.emit({name: CLOSE}); await b.drain();
+  assert.equal(b.session.login_wait_tab.manual, true);
+  b.advance(15 * 60_000); b.chrome.alarms.onAlarm.emit({name: DAILY}); await b.drain();
+  assert.equal(b.created.length, 2); const probe = b.session.owned_tab.id;
+  assert.equal((await b.send(message({clock_in: "10:00:00"}), {...b.sender, tab: {id: probe}})).ok, true);
+  assert.equal(b.session.login_wait_tab, undefined); assert.equal(b.local.last_attendance.clock_in, "10:00:00");
+  b.advance(15 * 60_000); b.chrome.alarms.onAlarm.emit({name: DAILY}); await b.drain(); assert.equal(b.created.length, 2);
+});
+test("daily cache still blocks nonmanual and automatic-OFF login probes", async () => {
+  for (const local of [{last_success_day: "2026-11-03"}, {last_success_day: "2026-11-03", auto_collect_enabled: false}]) {
+    const manual = local.auto_collect_enabled === false;
+    const b = background({local, session: {login_wait_tab: {id: 20, manual, working_day: "2026-11-03"}}, tabs: new Map([[20, {id: 20, active: true}]])});
+    b.advance(60 * 60_000); b.chrome.alarms.onAlarm.emit({name: DAILY}); await b.drain(); assert.equal(b.created.length, 0);
+  }
 });
